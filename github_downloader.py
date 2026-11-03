@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download a GitHub subdirectory as a zip file (public repos only)."""
+"""Download a GitHub subdirectory as a zip file (single API call version)."""
 
 import argparse
 import json
@@ -11,12 +11,7 @@ import zipfile
 
 
 def parse_github_url(url):
-    """Parse a GitHub URL and return (owner, repo, branch, path).
-
-    Supports:
-      https://github.com/owner/repo/tree/branch/path/to/dir
-      https://github.com/owner/repo  (downloads repo root, branch = HEAD)
-    """
+    """Parse a GitHub URL and return (owner, repo, branch, path)."""
     url = url.rstrip("/")
     prefix = "https://github.com/"
     if not url.startswith(prefix):
@@ -42,46 +37,62 @@ def parse_github_url(url):
 
 
 def fetch_json(url):
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "github-subdir-downloader/1.0"}
-    )
+    headers = {"User-Agent": "github-subdir-downloader/2.0"}
+    
+    # Optional: Still good practice to check for a token if one exists
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            raise ValueError(f"Not found (404): {url}") from exc
+            raise ValueError(f"Not found (404): {url}. Check branch/repo.") from exc
         if exc.code == 403:
             body = exc.read().decode()
             if "rate limit" in body.lower():
                 raise ValueError(
                     "GitHub API rate limit exceeded. "
-                    "Wait a few minutes and try again."
+                    "Wait a few minutes and try again, or export GITHUB_TOKEN."
                 ) from exc
             raise ValueError(f"GitHub API returned 403: {body}") from exc
         raise
 
 
-def list_files(owner, repo, branch, path, *, _depth=0):
-    """Recursively list all file entries under a path via the Contents API."""
+def list_files_via_tree(owner, repo, branch, target_path):
+    """Fetch the entire repo tree in one API call and filter locally."""
+    # The recursive=1 flag is the magic that gets all subdirectories at once
     api_url = (
-        f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-        f"?ref={branch}"
+        f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1"
     )
-    items = fetch_json(api_url)
+    
+    data = fetch_json(api_url)
 
-    if isinstance(items, dict):
-        # Single file returned directly (path pointed to a file, not a dir)
-        return [items]
+    if data.get("truncated"):
+        print("Warning: Repository is massive; tree was truncated by GitHub.", file=sys.stderr)
 
+    # Normalize target path to end with a slash to avoid partial word matches
+    # (e.g., matching "foo-bar" when searching for "foo")
+    prefix = target_path if not target_path else target_path.rstrip("/") + "/"
+    
     files = []
-    for item in items:
-        if item["type"] == "file":
-            files.append(item)
-        elif item["type"] == "dir":
-            files.extend(
-                list_files(owner, repo, branch, item["path"], _depth=_depth + 1)
-            )
+    for item in data.get("tree", []):
+        if item["type"] != "blob":
+            continue  # Skip directories; we only download actual files
+            
+        # Match files inside the target directory, or exactly the target file
+        if not target_path or item["path"].startswith(prefix) or item["path"] == target_path:
+            # The Git Trees API doesn't provide a direct download URL, 
+            # so we construct the raw.githubusercontent.com URL ourselves
+            download_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{item['path']}"
+            files.append({
+                "path": item["path"],
+                "download_url": download_url
+            })
+            
     return files
 
 
@@ -94,7 +105,7 @@ def build_zip(files, base_path, output_path):
 
             req = urllib.request.Request(
                 file_info["download_url"],
-                headers={"User-Agent": "github-subdir-downloader/1.0"},
+                headers={"User-Agent": "github-subdir-downloader/2.0"},
             )
             with urllib.request.urlopen(req) as resp:
                 content = resp.read()
@@ -115,7 +126,7 @@ def main():
 examples:
   %(prog)s https://github.com/owner/repo/tree/main/path/to/subdir
   %(prog)s https://github.com/owner/repo/tree/main/path/to/subdir -o my_output.zip
-""",
+"""
     )
     parser.add_argument("url", help="GitHub URL of the subdirectory to download")
     parser.add_argument(
@@ -141,9 +152,9 @@ examples:
         dir_name = path.split("/")[-1] if path else repo
         output_path = os.path.join(os.getcwd(), f"{dir_name}.zip")
 
-    print("\nFetching file list from GitHub API...")
+    print("\nFetching repository tree from GitHub API (1 call)...")
     try:
-        files = list_files(owner, repo, branch, path)
+        files = list_files_via_tree(owner, repo, branch, path)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
